@@ -26,6 +26,21 @@ import (
 // iTunesLibrary framework hands us. It's our small bouncer at the door.
 var errInvalidID = errors.New("invalid persistent ID")
 
+// Sentinel errors that the TUI can match with errors.Is to show the user a
+// message that actually points at the fix, instead of a generic "is it
+// installed?".
+var (
+	// ErrNotAuthorized means macOS hasn't granted this terminal permission to
+	// control Music (the Automation TCC prompt was never accepted, or was
+	// denied). This is the #1 reason playback silently does nothing.
+	ErrNotAuthorized = errors.New("not authorized to control Music")
+	// ErrMusicMissing means the Music app itself couldn't be found.
+	ErrMusicMissing = errors.New("Music app not found")
+	// ErrTrackNotFound means Music is reachable but the track wasn't in its
+	// library (e.g. the library hadn't finished loading after a cold launch).
+	ErrTrackNotFound = errors.New("track not found in Music library")
+)
+
 // isHexID reports whether s looks like the %016llX persistent IDs we mint in
 // library.go. We only ever feed osascript values that pass this check, so a
 // stray quote or AppleScript fragment can never sneak into the script.
@@ -56,8 +71,47 @@ type PlayerStatus struct {
 }
 
 func osascript(script string) (string, error) {
-	out, err := exec.Command("osascript", "-e", script).Output()
-	return strings.TrimSpace(string(out)), err
+	cmd := exec.Command("osascript", "-e", script)
+	var stdout, stderr strings.Builder
+	cmd.Stdout = &stdout
+	cmd.Stderr = &stderr
+	err := cmd.Run()
+	if err != nil {
+		return strings.TrimSpace(stdout.String()), classifyOsascriptErr(stderr.String(), err)
+	}
+	return strings.TrimSpace(stdout.String()), nil
+}
+
+// classifyOsascriptErr maps osascript's stderr to a sentinel error so the UI
+// can give actionable advice. osascript writes the human-readable message and
+// the AppleEvent error number (e.g. "(-1743)") to stderr; Output() used to
+// throw that away, leaving only "exit status 1".
+func classifyOsascriptErr(stderr string, fallback error) error {
+	msg := strings.TrimSpace(stderr)
+	switch {
+	// -1743: the user has not granted Automation permission for this app.
+	// -10004 (errAEPrivilegeError) shows up the same way before the prompt.
+	case strings.Contains(msg, "-1743"), strings.Contains(msg, "-10004"),
+		strings.Contains(strings.ToLower(msg), "not allowed assistive"),
+		strings.Contains(strings.ToLower(msg), "not authorized"),
+		strings.Contains(strings.ToLower(msg), "doesn't have permission"):
+		return fmt.Errorf("%w: %s", ErrNotAuthorized, msg)
+	// -1728: can't get the object; -1700: empty `whose` result coerced to a
+	// track. Both mean the track isn't in the library (or it never loaded).
+	case strings.Contains(msg, "-1728"), strings.Contains(msg, "-1700"),
+		strings.Contains(strings.ToLower(msg), "can’t get"),
+		strings.Contains(strings.ToLower(msg), "can't get"):
+		return fmt.Errorf("%w: %s", ErrTrackNotFound, msg)
+	// -1728 on the app object itself, or -600/-10814: app not found/launchable.
+	case strings.Contains(msg, "-600"), strings.Contains(msg, "-10814"),
+		strings.Contains(strings.ToLower(msg), "application isn’t running"),
+		strings.Contains(strings.ToLower(msg), "application can’t be found"):
+		return fmt.Errorf("%w: %s", ErrMusicMissing, msg)
+	}
+	if msg != "" {
+		return fmt.Errorf("%s: %w", msg, fallback)
+	}
+	return fallback
 }
 
 // PlayTrack starts playback of the library track with the given persistent ID.
@@ -67,7 +121,29 @@ func PlayTrack(persistentID string) error {
 	if !isHexID(persistentID) {
 		return errInvalidID
 	}
-	script := fmt.Sprintf(`tell application "Music" to play (first track of library playlist 1 whose persistent ID is "%s")`, persistentID)
+	// On a cold launch, Music's library playlist is empty until the library
+	// finishes loading, so a `play (... whose persistent ID ...)` would race it
+	// and fail with -1728/-1700. We launch Music, then wait *only* while the
+	// playlist is still empty (loading). Once it has tracks, a missing ID is a
+	// genuine miss (e.g. a cloud track with no scriptable counterpart) and we
+	// fail fast instead of spinning for seconds.
+	script := fmt.Sprintf(`tell application "Music"
+	launch
+	-- Wait for the library to load (empty until then on a cold launch).
+	repeat 40 times
+		if (count of tracks of library playlist 1) > 0 then exit repeat
+		delay 0.25
+	end repeat
+	set theTrack to (first track of library playlist 1 whose persistent ID is "%s")
+	-- A freshly-launched player can swallow the first play command, reporting
+	-- success while staying stopped. Issue play and confirm it actually
+	-- started, then retry a few times before giving up.
+	repeat 12 times
+		play theTrack
+		delay 0.25
+		if player state is playing then return
+	end repeat
+end tell`, persistentID)
 	_, err := osascript(script)
 	return err
 }
@@ -92,7 +168,12 @@ const statusScript = `if application "Music" is not running then return "stopped
 tell application "Music"
 	if player state is stopped then return "stopped"
 	set sep to character id 31
-	set t to current track
+	try
+		set t to current track
+	on error
+		-- Playing/paused but no readable current track (e.g. mid-transition).
+		return "stopped"
+	end try
 	return (player state as text) & sep & (name of t) & sep & (artist of t) & sep & (player position as text) & sep & ((duration of t) as text) & sep & (persistent ID of t)
 end tell`
 

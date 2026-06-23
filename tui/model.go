@@ -15,6 +15,7 @@
 package tui
 
 import (
+	"errors"
 	"fmt"
 	"io"
 	"strings"
@@ -84,7 +85,7 @@ func (d rowDelegate) Render(w io.Writer, m list.Model, index int, listItem list.
 		return
 	}
 
-	var left, right string
+	var left, right, stars string
 	playing := false
 	switch v := listItem.(type) {
 	case artistItem:
@@ -103,7 +104,11 @@ func (d rowDelegate) Render(w io.Writer, m list.Model, index int, listItem list.
 		} else {
 			left = v.track.Name
 		}
+		stars = ratingStars(v.track.Rating)
 		right = v.track.DurationString()
+		if stars != "" {
+			right = stars + "  " + right // stars sit just left of the duration
+		}
 		playing = d.playingID != "" && d.playingID == v.track.PersistentID
 	default:
 		return
@@ -141,8 +146,27 @@ func (d rowDelegate) Render(w io.Writer, m list.Model, index int, listItem list.
 	case playing:
 		fmt.Fprint(w, playingRowStyle.Render(prefix+left+pad+right))
 	default:
-		fmt.Fprint(w, rowStyle.Render(prefix+left)+pad+dimStyle.Render(right))
+		// Stars (if any) glow amber; the duration stays dim.
+		rightStyled := dimStyle.Render(right)
+		if stars != "" {
+			dur := strings.TrimPrefix(right, stars)
+			rightStyled = starStyle.Render(stars) + dimStyle.Render(dur)
+		}
+		fmt.Fprint(w, rowStyle.Render(prefix+left)+pad+rightStyled)
 	}
+}
+
+// ratingStars renders a 0–100 Music rating as filled amber stars (1 star per
+// 20 points). Unrated tracks get nothing — the row stays clean.
+func ratingStars(rating int) string {
+	n := rating / 20
+	if n < 1 {
+		return ""
+	}
+	if n > 5 {
+		n = 5
+	}
+	return strings.Repeat("★", n)
 }
 
 // ---------------------------------------------------------------------------
@@ -154,6 +178,11 @@ type LibraryErrorMsg struct{ Err error }
 type statusMsg struct{ status music.PlayerStatus }
 type playbackErrMsg struct{ err error }
 type tickMsg time.Time
+type frameMsg time.Time
+
+// frameInterval drives the visualizer animation, independent of the 2s status
+// poll. ~8fps is smooth enough to read as motion without burning the terminal.
+const frameInterval = 120 * time.Millisecond
 
 // ---------------------------------------------------------------------------
 // Model
@@ -176,6 +205,7 @@ type Model struct {
 	player    music.PlayerStatus
 	playingID string
 	playErr   error // last playback hiccup, shown in the now-playing bar
+	viz       visualizer
 
 	selectedArtist string
 	selectedAlbum  string
@@ -225,7 +255,7 @@ func New() Model {
 // ---------------------------------------------------------------------------
 
 func (m Model) Init() tea.Cmd {
-	return tea.Batch(loadLibrary, fetchStatus, tickCmd(), m.spin.Tick)
+	return tea.Batch(loadLibrary, fetchStatus, tickCmd(), frameCmd(), m.spin.Tick)
 }
 
 func loadLibrary() tea.Msg {
@@ -243,6 +273,10 @@ func fetchStatus() tea.Msg {
 
 func tickCmd() tea.Cmd {
 	return tea.Tick(2*time.Second, func(t time.Time) tea.Msg { return tickMsg(t) })
+}
+
+func frameCmd() tea.Cmd {
+	return tea.Tick(frameInterval, func(t time.Time) tea.Msg { return frameMsg(t) })
 }
 
 // playbackCmd runs a player action and reports any error, then refreshes
@@ -269,6 +303,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.width = msg.Width
 		m.height = msg.Height
 		m.search.Width = max(m.width-8, 10)
+		m.viz.resize(m.width - 2) // stage inner width; keeps step()'s slice sized
 		m.updatePaneSizes()
 		return m, nil
 
@@ -293,6 +328,11 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case tickMsg:
 		return m, tea.Batch(fetchStatus, tickCmd())
+
+	case frameMsg:
+		seed := m.player.PersistentID + m.player.Track
+		m.viz.step(m.player.State, seed, m.player.Position)
+		return m, frameCmd()
 
 	case playbackErrMsg:
 		m.playErr = msg.err
@@ -480,8 +520,8 @@ func (m Model) paneWidths() (int, int) {
 
 func (m *Model) updatePaneSizes() {
 	sw, cw := m.paneWidths()
-	// header(1) + now-playing(1) + bottom bar(1) + pane borders(2)
-	listH := m.height - 5
+	// header(1) + stage(2: visualizer + transport) + bottom bar(1) + pane borders(2)
+	listH := m.height - 7
 	if listH < 3 {
 		listH = 3
 	}
@@ -586,7 +626,8 @@ func (m Model) View() string {
 }
 
 func (m Model) headerView() string {
-	left := logoStyle.Render("") + " " + headerTitleStyle.Render("Apple Music")
+	// Wordmark: a small equalizer glyph + spaced letters for presence.
+	left := logoStyle.Render("▰▰▱") + " " + headerTitleStyle.Render("Z E S T")
 	right := ""
 	if m.library != nil {
 		right = headerMetaStyle.Render(fmt.Sprintf("%d songs · %d artists", len(m.library.Tracks), len(m.library.Artists)))
@@ -598,19 +639,45 @@ func (m Model) headerView() string {
 	return headerBarStyle.Render(left + strings.Repeat(" ", gap) + right)
 }
 
+// playErrMessage turns a playback error into a one-line hint that points at
+// the actual fix. The permission case is the common one — the macOS Automation
+// prompt has to be accepted once before zest can drive Music at all.
+func playErrMessage(err error) string {
+	switch {
+	case errors.Is(err, music.ErrNotAuthorized):
+		return "grant permission: System Settings ▸ Privacy & Security ▸ Automation ▸ allow this terminal to control Music"
+	case errors.Is(err, music.ErrMusicMissing):
+		return "couldn't launch Music.app — is it installed?"
+	case errors.Is(err, music.ErrTrackNotFound):
+		return "can't play this track — it's not in Music's playable library (cloud-only track?)"
+	default:
+		return "playback failed — couldn't reach Music.app"
+	}
+}
+
+// nowPlayingView renders the two-row stage: the live visualizer on top, then
+// the transport line (icon · track — artist … position bar duration).
 func (m Model) nowPlayingView() string {
 	inner := m.width - 2
+	if inner < 1 {
+		inner = 1
+	}
 	st := m.player
+
 	if st.State != "playing" && st.State != "paused" {
+		viz := npBarStyle.Render(m.viz.render(inner))
+		var line string
 		if m.playErr != nil {
-			return npBarStyle.Render(errorStyle.Render("◼ couldn't reach Music.app — is it installed?"))
+			line = errorStyle.Render("◼ " + playErrMessage(m.playErr))
+		} else {
+			line = dimStyle.Render("◼ nothing playing — press ↵ on a track")
 		}
-		return npBarStyle.Render(dimStyle.Render("◼ nothing playing — press ↵ on a track"))
+		return viz + "\n" + npBarStyle.Render(line)
 	}
 
 	icon := barFillStyle.Render("▶")
 	if st.State == "paused" {
-		icon = dimStyle.Render("▶")
+		icon = dimStyle.Render("❚❚")
 	}
 
 	cur, tot := fmtTime(st.Position), fmtTime(st.Duration)
@@ -640,7 +707,8 @@ func (m Model) nowPlayingView() string {
 	if gap < 1 {
 		gap = 1
 	}
-	return npBarStyle.Render(icon + " " + meta + strings.Repeat(" ", gap) + right)
+	transport := npBarStyle.Render(icon + " " + meta + strings.Repeat(" ", gap) + right)
+	return npBarStyle.Render(m.viz.render(inner)) + "\n" + transport
 }
 
 func renderBar(pos, dur float64, w int) string {

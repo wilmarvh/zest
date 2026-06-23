@@ -17,8 +17,10 @@ package tui
 import "github.com/charmbracelet/lipgloss"
 
 var (
-	// Palette — Apple Music red plus macOS dark-mode grays.
-	cRed    = lipgloss.Color("#FA233B")
+	// Palette — an ember gradient (the visualizer's voice) over macOS dark grays.
+	cRed    = lipgloss.Color("#FA233B") // ember — primary accent, the anchor
+	cCoral  = lipgloss.Color("#FF6B5C") // gradient mid — warm transients
+	cAmber  = lipgloss.Color("#FFB347") // gradient peak — hot tops & star ratings
 	cWhite  = lipgloss.Color("#F5F5F7")
 	cText   = lipgloss.Color("#D1D1D6")
 	cGray   = lipgloss.Color("#98989D")
@@ -27,6 +29,10 @@ var (
 	cSelBg  = lipgloss.Color("#FA233B")
 	cMuteBg = lipgloss.Color("#3A3A3C")
 	cBorder = lipgloss.Color("#3A3A3C")
+
+	// Visualizer gradient, low band → hot top. Indexed by bar height.
+	vizGradient = []lipgloss.Color{cRed, cRed, cCoral, cCoral, cAmber}
+	starStyle   = lipgloss.NewStyle().Foreground(cAmber)
 
 	// Header bar
 	headerBarStyle   = lipgloss.NewStyle().Padding(0, 1)
@@ -53,13 +59,14 @@ var (
 	mutedSelStyle   = lipgloss.NewStyle().Foreground(cWhite).Background(cMuteBg)
 	playingRowStyle = lipgloss.NewStyle().Foreground(cRed)
 
-	// Now-playing bar
+	// Now-playing stage
 	npBarStyle    = lipgloss.NewStyle().Padding(0, 1)
 	npTrackStyle  = lipgloss.NewStyle().Foreground(cWhite).Bold(true)
 	npArtistStyle = lipgloss.NewStyle().Foreground(cGray)
 	npTimeStyle   = lipgloss.NewStyle().Foreground(cDim)
 	barFillStyle  = lipgloss.NewStyle().Foreground(cRed)
 	barEmptyStyle = lipgloss.NewStyle().Foreground(cFaint)
+	vizIdleStyle  = lipgloss.NewStyle().Foreground(cFaint)
 
 	// Bottom bar
 	helpStyle         = lipgloss.NewStyle().Foreground(cDim).Padding(0, 1)
