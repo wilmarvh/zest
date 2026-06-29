@@ -68,6 +68,8 @@ type PlayerStatus struct {
 	Position     float64 // seconds
 	Duration     float64 // seconds
 	PersistentID string  // uppercase hex, matches Track.PersistentID
+	Shuffle      bool    // Music's shuffle toggle
+	Repeat       string  // "off", "one", or "all"
 }
 
 func osascript(script string) (string, error) {
@@ -148,9 +150,99 @@ end tell`, persistentID)
 	return err
 }
 
+// PlayAlbumFromTrack queues the given album's tracks (in order) and starts
+// playback at startID, so the album plays through instead of falling back to
+// Music's own queue after one track. albumIDs is the album's persistent IDs in
+// track order; startID must be one of them.
+//
+// We build a temporary playlist ("zest queue"), fill it in order, then play
+// the *playlist* and skip to the chosen track. The subtle part: `play <track>`
+// plays the track in its library container, so Music's "up next" ignores our
+// ordering and wanders off after one song. `play <playlist>` instead makes the
+// playlist the active queue; we then `next track` startIdx times to land on the
+// requested start while keeping the rest of the album queued behind it.
+// Shuffle is forced off so "play album" really plays the album front-to-back.
+func PlayAlbumFromTrack(albumIDs []string, startID string) error {
+	if !isHexID(startID) {
+		return errInvalidID
+	}
+	var startIdx = -1
+	for i, id := range albumIDs {
+		if !isHexID(id) {
+			return errInvalidID
+		}
+		if id == startID {
+			startIdx = i
+		}
+	}
+	if startIdx < 0 {
+		return errInvalidID
+	}
+
+	// Build the AppleScript list of "add track" lines. Each ID is validated
+	// hex above, so interpolation is safe.
+	var adds strings.Builder
+	for _, id := range albumIDs {
+		fmt.Fprintf(&adds, "\n\tduplicate (first track of library playlist 1 whose persistent ID is \"%s\") to q", id)
+	}
+
+	script := fmt.Sprintf(`tell application "Music"
+	launch
+	repeat 40 times
+		if (count of tracks of library playlist 1) > 0 then exit repeat
+		delay 0.25
+	end repeat
+	-- Shuffle off so the album plays in order, front to back.
+	set shuffle enabled to false
+	-- Recreate a scratch playlist each time so a stale queue can't linger.
+	if (exists user playlist "zest queue") then delete user playlist "zest queue"
+	set q to make new user playlist with properties {name:"zest queue"}%s
+	-- Play the playlist (not a track) so it becomes the active queue.
+	repeat 12 times
+		play q
+		delay 0.25
+		if player state is playing then exit repeat
+	end repeat
+	-- Advance to the requested start track; the rest stay queued behind it.
+	-- A short settle between skips keeps Music from swallowing them while
+	-- playback is still spinning up.
+	repeat %d times
+		next track
+		delay 0.15
+	end repeat
+end tell`, adds.String(), startIdx)
+	_, err := osascript(script)
+	return err
+}
+
 func PlayPause() error {
 	_, err := osascript(`tell application "Music" to playpause`)
 	return err
+}
+
+// ToggleShuffle flips Music's shuffle on/off and returns the new state.
+func ToggleShuffle() (bool, error) {
+	out, err := osascript(`tell application "Music"
+	set shuffle enabled to not (shuffle enabled)
+	return shuffle enabled as text
+end tell`)
+	return out == "true", err
+}
+
+// CycleRepeat advances repeat through off → all → one → off and returns the
+// new mode ("off", "all", "one").
+func CycleRepeat() (string, error) {
+	out, err := osascript(`tell application "Music"
+	if song repeat is off then
+		set song repeat to all
+	else if song repeat is all then
+		set song repeat to one
+	else
+		set song repeat to off
+	end if
+	return song repeat as text
+end tell`)
+	return out, err
 }
 
 func NextTrack() error {
@@ -174,7 +266,7 @@ tell application "Music"
 		-- Playing/paused but no readable current track (e.g. mid-transition).
 		return "stopped"
 	end try
-	return (player state as text) & sep & (name of t) & sep & (artist of t) & sep & (player position as text) & sep & ((duration of t) as text) & sep & (persistent ID of t)
+	return (player state as text) & sep & (name of t) & sep & (artist of t) & sep & (player position as text) & sep & ((duration of t) as text) & sep & (persistent ID of t) & sep & (shuffle enabled as text) & sep & (song repeat as text)
 end tell`
 
 // Status polls the Music app. Returns a stopped status if Music isn't running.
@@ -187,7 +279,7 @@ func Status() (PlayerStatus, error) {
 		return PlayerStatus{State: "stopped"}, nil
 	}
 	parts := strings.Split(out, "\x1f")
-	if len(parts) != 6 {
+	if len(parts) != 8 {
 		return PlayerStatus{State: "stopped"}, nil
 	}
 	// AppleScript may use a comma decimal separator depending on locale.
@@ -200,5 +292,7 @@ func Status() (PlayerStatus, error) {
 		Position:     pos,
 		Duration:     dur,
 		PersistentID: parts[5],
+		Shuffle:      parts[6] == "true",
+		Repeat:       parts[7],
 	}, nil
 }

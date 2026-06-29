@@ -66,6 +66,12 @@ type trackItem struct{ track music.Track }
 
 func (i trackItem) FilterValue() string { return i.track.Name }
 
+// playAlbumItem is the "▶ Play album" action row that sits at the top of the
+// track view. Selecting it queues the whole album (shuffle off, in order).
+type playAlbumItem struct{ ids []string }
+
+func (i playAlbumItem) FilterValue() string { return "" }
+
 // ---------------------------------------------------------------------------
 // Row delegate
 // ---------------------------------------------------------------------------
@@ -88,6 +94,9 @@ func (d rowDelegate) Render(w io.Writer, m list.Model, index int, listItem list.
 	var left, right, stars string
 	playing := false
 	switch v := listItem.(type) {
+	case playAlbumItem:
+		left = "▶ Play album"
+		right = fmt.Sprintf("%d ♪", len(v.ids))
 	case artistItem:
 		left = v.artist.Name
 		n := 0
@@ -178,11 +187,6 @@ type LibraryErrorMsg struct{ Err error }
 type statusMsg struct{ status music.PlayerStatus }
 type playbackErrMsg struct{ err error }
 type tickMsg time.Time
-type frameMsg time.Time
-
-// frameInterval drives the visualizer animation, independent of the 2s status
-// poll. ~8fps is smooth enough to read as motion without burning the terminal.
-const frameInterval = 120 * time.Millisecond
 
 // ---------------------------------------------------------------------------
 // Model
@@ -205,7 +209,6 @@ type Model struct {
 	player    music.PlayerStatus
 	playingID string
 	playErr   error // last playback hiccup, shown in the now-playing bar
-	viz       visualizer
 
 	selectedArtist string
 	selectedAlbum  string
@@ -255,7 +258,7 @@ func New() Model {
 // ---------------------------------------------------------------------------
 
 func (m Model) Init() tea.Cmd {
-	return tea.Batch(loadLibrary, fetchStatus, tickCmd(), frameCmd(), m.spin.Tick)
+	return tea.Batch(loadLibrary, fetchStatus, tickCmd(), m.spin.Tick)
 }
 
 func loadLibrary() tea.Msg {
@@ -275,10 +278,6 @@ func tickCmd() tea.Cmd {
 	return tea.Tick(2*time.Second, func(t time.Time) tea.Msg { return tickMsg(t) })
 }
 
-func frameCmd() tea.Cmd {
-	return tea.Tick(frameInterval, func(t time.Time) tea.Msg { return frameMsg(t) })
-}
-
 // playbackCmd runs a player action and reports any error, then refreshes
 // status so the now-playing bar reflects what actually happened.
 func playbackCmd(action func() error) tea.Cmd {
@@ -292,6 +291,10 @@ func playTrackCmd(persistentID string) tea.Cmd {
 	return playbackCmd(func() error { return music.PlayTrack(persistentID) })
 }
 
+func playAlbumCmd(albumIDs []string, startID string) tea.Cmd {
+	return playbackCmd(func() error { return music.PlayAlbumFromTrack(albumIDs, startID) })
+}
+
 // ---------------------------------------------------------------------------
 // Update
 // ---------------------------------------------------------------------------
@@ -303,7 +306,6 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.width = msg.Width
 		m.height = msg.Height
 		m.search.Width = max(m.width-8, 10)
-		m.viz.resize(m.width - 2) // stage inner width; keeps step()'s slice sized
 		m.updatePaneSizes()
 		return m, nil
 
@@ -328,11 +330,6 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case tickMsg:
 		return m, tea.Batch(fetchStatus, tickCmd())
-
-	case frameMsg:
-		seed := m.player.PersistentID + m.player.Track
-		m.viz.step(m.player.State, seed, m.player.Position)
-		return m, frameCmd()
 
 	case playbackErrMsg:
 		m.playErr = msg.err
@@ -389,6 +386,12 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	case "p":
 		return m, playbackCmd(music.PreviousTrack)
 
+	case "s":
+		return m, playbackCmd(func() error { _, err := music.ToggleShuffle(); return err })
+
+	case "r":
+		return m, playbackCmd(func() error { _, err := music.CycleRepeat(); return err })
+
 	case "tab", "right", "l":
 		if m.focus == SidebarPane {
 			m.focus = ContentPane
@@ -433,7 +436,17 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			m.selectedAlbum = it.album.Name
 			m.level = LevelTracks
 			m.populateTracks(m.selectedArtist, it.album.Name)
+		case playAlbumItem:
+			// Queue the whole album in order (shuffle off).
+			if len(it.ids) == 0 {
+				return m, nil
+			}
+			m.playingID = it.ids[0]
+			m.updateDelegates()
+			return m, playAlbumCmd(it.ids, it.ids[0])
 		case trackItem:
+			// Single track: play just this one and let Music continue with
+			// whatever it would play next.
 			m.playingID = it.track.PersistentID
 			m.updateDelegates()
 			return m, playTrackCmd(it.track.PersistentID)
@@ -461,9 +474,21 @@ func (m Model) handleSearchKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return m, nil
 
 	case "enter":
+		// Commit the search and select the highlighted result in one press.
 		m.searching = false
 		m.search.Blur()
-		return m, nil
+		return m.handleKey(msg)
+
+	case "up", "down":
+		// Let the arrows drive the focused list mid-search, so you can filter
+		// and navigate to a result without leaving the search box first.
+		var cmd tea.Cmd
+		if m.focus == SidebarPane {
+			m.sidebar, cmd = m.sidebar.Update(msg)
+		} else {
+			m.content, cmd = m.content.Update(msg)
+		}
+		return m, cmd
 	}
 
 	var cmd tea.Cmd
@@ -520,8 +545,8 @@ func (m Model) paneWidths() (int, int) {
 
 func (m *Model) updatePaneSizes() {
 	sw, cw := m.paneWidths()
-	// header(1) + stage(2: visualizer + transport) + bottom bar(1) + pane borders(2)
-	listH := m.height - 7
+	// header(1) + now-playing(1) + bottom bar(1) + pane borders(2)
+	listH := m.height - 6
 	if listH < 3 {
 		listH = 3
 	}
@@ -570,9 +595,11 @@ func (m *Model) populateTracks(artistName, albumName string) {
 		}
 		for _, al := range a.Albums {
 			if al.Name == albumName {
-				items := make([]list.Item, len(al.Tracks))
-				for i, t := range al.Tracks {
-					items[i] = trackItem{track: t}
+				// "▶ Play album" action sits first, above the tracks.
+				items := make([]list.Item, 0, len(al.Tracks)+1)
+				items = append(items, playAlbumItem{ids: albumTrackIDs(al.Tracks)})
+				for _, t := range al.Tracks {
+					items = append(items, trackItem{track: t})
 				}
 				m.content.SetItems(items)
 				m.content.Title = artistName + " › " + albumName
@@ -581,6 +608,15 @@ func (m *Model) populateTracks(artistName, albumName string) {
 			}
 		}
 	}
+}
+
+// albumTrackIDs pulls the persistent IDs from an album's tracks, in order.
+func albumTrackIDs(tracks []music.Track) []string {
+	ids := make([]string, len(tracks))
+	for i, t := range tracks {
+		ids[i] = t.PersistentID
+	}
+	return ids
 }
 
 func fmtTime(sec float64) string {
@@ -655,8 +691,8 @@ func playErrMessage(err error) string {
 	}
 }
 
-// nowPlayingView renders the two-row stage: the live visualizer on top, then
-// the transport line (icon · track — artist … position bar duration).
+// nowPlayingView renders the transport line:
+// icon · track — artist … shuffle repeat position bar duration.
 func (m Model) nowPlayingView() string {
 	inner := m.width - 2
 	if inner < 1 {
@@ -665,14 +701,13 @@ func (m Model) nowPlayingView() string {
 	st := m.player
 
 	if st.State != "playing" && st.State != "paused" {
-		viz := npBarStyle.Render(m.viz.render(inner))
 		var line string
 		if m.playErr != nil {
 			line = errorStyle.Render("◼ " + playErrMessage(m.playErr))
 		} else {
 			line = dimStyle.Render("◼ nothing playing — press ↵ on a track")
 		}
-		return viz + "\n" + npBarStyle.Render(line)
+		return npBarStyle.Render(line)
 	}
 
 	icon := barFillStyle.Render("▶")
@@ -702,13 +737,36 @@ func (m Model) nowPlayingView() string {
 		meta += npArtistStyle.Render(" — " + truncate.StringWithTail(st.Artist, uint(rem-3), "…"))
 	}
 
-	right := npTimeStyle.Render(cur) + " " + renderBar(st.Position, st.Duration, barW) + " " + npTimeStyle.Render(tot)
+	modes := modeIndicators(st.Shuffle, st.Repeat)
+	right := modes + npTimeStyle.Render(cur) + " " + renderBar(st.Position, st.Duration, barW) + " " + npTimeStyle.Render(tot)
 	gap := inner - 2 - lipgloss.Width(meta) - lipgloss.Width(right)
 	if gap < 1 {
 		gap = 1
 	}
-	transport := npBarStyle.Render(icon + " " + meta + strings.Repeat(" ", gap) + right)
-	return npBarStyle.Render(m.viz.render(inner)) + "\n" + transport
+	return npBarStyle.Render(icon + " " + meta + strings.Repeat(" ", gap) + right)
+}
+
+// modeIndicators renders shuffle/repeat glyphs, bright when on and dim when
+// off, so their state is always visible in the now-playing bar. Returns a
+// trailing space when anything is shown so it sits flush before the timer.
+func modeIndicators(shuffle bool, repeat string) string {
+	var b strings.Builder
+	if shuffle {
+		b.WriteString(barFillStyle.Render("⇄"))
+	} else {
+		b.WriteString(dimStyle.Render("⇄"))
+	}
+	b.WriteString(" ")
+	switch repeat {
+	case "one":
+		b.WriteString(barFillStyle.Render("↻¹"))
+	case "all":
+		b.WriteString(barFillStyle.Render("↻"))
+	default:
+		b.WriteString(dimStyle.Render("↻"))
+	}
+	b.WriteString("  ")
+	return b.String()
 }
 
 func renderBar(pos, dur float64, w int) string {
@@ -736,6 +794,6 @@ func (m Model) bottomView() string {
 	if m.searching {
 		return searchBarStyle.Render(m.search.View())
 	}
-	help := "↑↓/jk move · ⇥ pane · ↵ play · space pause · n/p skip · / search · esc back · q quit"
+	help := "↑↓/jk move · ⇥ pane · ↵ select · space pause · n/p skip · s shuffle · r repeat · / search · esc back · q quit"
 	return helpStyle.Render(truncate.String(help, uint(max(m.width-2, 10))))
 }
