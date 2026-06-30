@@ -22,9 +22,12 @@ framework (no API keys, no entitlements) and controls playback by driving the
 ## Features
 
 - Browse your full library by **artist → album → track**
+- **Play album** — queue a whole album and play it through in order (shuffle off)
 - **Play, pause, skip** tracks through Music.app
+- **Shuffle and repeat** controls, with their state shown in the now-playing bar
 - Live **now-playing bar** with progress
-- Live **search** across artists and track names
+- Live **search** across artists, **albums**, and track names — navigate results
+  with the arrows without leaving the search box
 - Vim-style and arrow-key navigation
 - Reads the library locally — fast even with tens of thousands of tracks
 
@@ -79,12 +82,18 @@ Grant both. You can review or revoke these later in
 | `↑` `↓` / `j` `k` | Navigate the focused pane |
 | `tab` / `→` / `l` | Focus the content pane |
 | `shift+tab` / `←` / `h` | Focus the sidebar / go back |
-| `enter` | Drill down — on a track, play it |
+| `enter` | Drill down — on a track play it, on **▶ Play album** queue the album |
 | `space` | Play / pause |
 | `n` / `p` | Next / previous track |
+| `s` | Toggle shuffle |
+| `r` | Cycle repeat (off → all → one) |
 | `esc` | Back one level |
-| `/` | Search |
+| `/` | Search (arrows navigate results, `enter` selects) |
 | `q` / `ctrl+c` | Quit |
+
+Inside an album, the first row is **▶ Play album**: select it to queue the
+whole album and play it front-to-back with shuffle off. Pressing `enter` on a
+single track instead plays just that track and lets Music continue as it would.
 
 ## How it works
 
@@ -94,12 +103,18 @@ Grant both. You can review or revoke these later in
   matches tracks by their persistent ID. Music.app's running state is checked
   *before* polling status so the app is never launched just to read state; on
   play it launches Music and waits for the library to load before issuing the
-  command. The only value interpolated into an AppleScript is the persistent ID,
-  and it's validated as plain hex first — so no metadata can wander into a
-  command. AppleScript errors are classified (permission denied, track not
-  playable, Music missing) so failures point at the actual fix.
+  command. **Play album** builds a scratch "zest queue" playlist from the chosen
+  track onward and plays the *playlist* (not a track), which makes Music treat it
+  as the active queue so the album plays through in order instead of falling back
+  to Music's own shuffle. IDs the framework lists but Music can't resolve (e.g.
+  duplicate cloud entries) are skipped rather than aborting the queue. The only
+  values interpolated into an AppleScript are persistent IDs, each validated as
+  plain hex first — so no metadata can wander into a command. AppleScript errors
+  are classified (permission denied, track not playable, Music missing) so
+  failures point at the actual fix.
 - **UI** (`tui/`) — a Bubble Tea model renders a two-pane layout and polls the
-  player every 2 seconds for the now-playing bar.
+  player every 2 seconds for the now-playing bar. Search filters the artist
+  sidebar by artist, album, or track name.
 
 MusicKit was intentionally avoided: it requires a signed `.app` with
 entitlements, which doesn't fit a `go build` CLI workflow.
