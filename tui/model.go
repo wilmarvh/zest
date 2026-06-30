@@ -498,30 +498,39 @@ func (m Model) handleSearchKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		if query == "" {
 			m.populateSidebar(m.library.Artists)
 		} else {
-			var filtered []music.Artist
-			for _, a := range m.library.Artists {
-				if strings.Contains(strings.ToLower(a.Name), query) {
-					filtered = append(filtered, a)
-					continue
-				}
-				for _, al := range a.Albums {
-					matched := false
-					for _, t := range al.Tracks {
-						if strings.Contains(strings.ToLower(t.Name), query) {
-							matched = true
-							break
-						}
-					}
-					if matched {
-						filtered = append(filtered, a)
-						break
-					}
-				}
-			}
-			m.populateSidebar(filtered)
+			m.populateSidebar(filterArtists(m.library.Artists, query))
 		}
 	}
 	return m, cmd
+}
+
+// filterArtists keeps artists whose name, any album name, or any track name
+// contains the (already lower-cased) query.
+func filterArtists(artists []music.Artist, query string) []music.Artist {
+	var filtered []music.Artist
+	for _, a := range artists {
+		if artistMatches(a, query) {
+			filtered = append(filtered, a)
+		}
+	}
+	return filtered
+}
+
+func artistMatches(a music.Artist, query string) bool {
+	if strings.Contains(strings.ToLower(a.Name), query) {
+		return true
+	}
+	for _, al := range a.Albums {
+		if strings.Contains(strings.ToLower(al.Name), query) {
+			return true
+		}
+		for _, t := range al.Tracks {
+			if strings.Contains(strings.ToLower(t.Name), query) {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 // ---------------------------------------------------------------------------
