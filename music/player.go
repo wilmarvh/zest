@@ -150,23 +150,27 @@ end tell`, persistentID)
 	return err
 }
 
-// PlayAlbumFromTrack queues the given album's tracks (in order) and starts
-// playback at startID, so the album plays through instead of falling back to
-// Music's own queue after one track. albumIDs is the album's persistent IDs in
-// track order; startID must be one of them.
+// PlayAlbumFromTrack queues the album from startID onward and starts playback
+// there, so the album plays through instead of falling back to Music's own
+// queue after one track. albumIDs is the album's persistent IDs in track order;
+// startID must be one of them.
 //
-// We build a temporary playlist ("zest queue"), fill it in order, then play
-// the *playlist* and skip to the chosen track. The subtle part: `play <track>`
-// plays the track in its library container, so Music's "up next" ignores our
-// ordering and wanders off after one song. `play <playlist>` instead makes the
-// playlist the active queue; we then `next track` startIdx times to land on the
-// requested start while keeping the rest of the album queued behind it.
-// Shuffle is forced off so "play album" really plays the album front-to-back.
+// We build a temporary playlist ("zest queue") containing the tracks from
+// startID to the end, in order, then `play <playlist>`. Two subtleties:
+//   - `play <track>` plays the track in its library container, so Music's "up
+//     next" ignores our ordering and wanders off after one song. `play
+//     <playlist>` makes the playlist the active queue instead.
+//   - `play <playlist>` always starts at the playlist's first item. Skipping
+//     forward to a start track afterwards races playback startup and silently
+//     drops skips, so instead we put the start track first in the playlist —
+//     no skipping, deterministic.
+//
+// Shuffle is forced off so the album plays front-to-back.
 func PlayAlbumFromTrack(albumIDs []string, startID string) error {
 	if !isHexID(startID) {
 		return errInvalidID
 	}
-	var startIdx = -1
+	startIdx := -1
 	for i, id := range albumIDs {
 		if !isHexID(id) {
 			return errInvalidID
@@ -179,11 +183,18 @@ func PlayAlbumFromTrack(albumIDs []string, startID string) error {
 		return errInvalidID
 	}
 
-	// Build the AppleScript list of "add track" lines. Each ID is validated
-	// hex above, so interpolation is safe.
+	// Build the "add track" lines from the start track to the album's end, in
+	// order, so play <playlist> begins exactly where we want with no skipping.
+	// Each ID is validated hex above, so interpolation is safe.
+	//
+	// Each duplicate is wrapped in try: the iTunesLibrary framework (our loader)
+	// and AppleScript don't always agree on which persistent IDs exist — e.g. a
+	// duplicate cloud entry the framework lists but `library playlist 1` can't
+	// resolve. Without the try, one such ID throws -1728 and aborts the whole
+	// script, so nothing plays. Skipping it queues the rest of the album.
 	var adds strings.Builder
-	for _, id := range albumIDs {
-		fmt.Fprintf(&adds, "\n\tduplicate (first track of library playlist 1 whose persistent ID is \"%s\") to q", id)
+	for _, id := range albumIDs[startIdx:] {
+		fmt.Fprintf(&adds, "\n\ttry\n\t\tduplicate (first track of library playlist 1 whose persistent ID is \"%s\") to q\n\tend try", id)
 	}
 
 	script := fmt.Sprintf(`tell application "Music"
@@ -197,20 +208,16 @@ func PlayAlbumFromTrack(albumIDs []string, startID string) error {
 	-- Recreate a scratch playlist each time so a stale queue can't linger.
 	if (exists user playlist "zest queue") then delete user playlist "zest queue"
 	set q to make new user playlist with properties {name:"zest queue"}%s
-	-- Play the playlist (not a track) so it becomes the active queue.
+	-- If every track failed to resolve, surface it instead of silently no-op'ing.
+	if (count of tracks of q) is 0 then error "no playable tracks in album" number -1728
+	-- Play the playlist (not a track) so it becomes the active queue. The start
+	-- track is already first, so this begins exactly where requested.
 	repeat 12 times
 		play q
 		delay 0.25
-		if player state is playing then exit repeat
+		if player state is playing then return
 	end repeat
-	-- Advance to the requested start track; the rest stay queued behind it.
-	-- A short settle between skips keeps Music from swallowing them while
-	-- playback is still spinning up.
-	repeat %d times
-		next track
-		delay 0.15
-	end repeat
-end tell`, adds.String(), startIdx)
+end tell`, adds.String())
 	_, err := osascript(script)
 	return err
 }
